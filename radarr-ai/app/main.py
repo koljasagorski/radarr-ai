@@ -2156,58 +2156,47 @@ def lookup_movie(req: LookupRequest):
 @app.post("/recommend-movies")
 def recommend_movies(req: RecommendRequest):
     try:
-        context = get_radarr_context()
-        existing_tmdb = {m.get("tmdbId") for m in context["movies"] if m.get("tmdbId")}
+        movies = radarr_get("movie")
+        existing_tmdb = {m.get("tmdbId") for m in movies if m.get("tmdbId")}
+        existing_lines = "\n".join(
+            f"- {m.get('title')} ({m.get('year') or '?'})"
+            for m in movies[:300]
+            if m.get("title")
+        )
 
         seen_items = load_seen_movies()
         seen_ids = {i.get("tmdbId") for i in seen_items if i.get("tmdbId")}
-        already_seen = [
-            {"title": i.get("title"), "year": i.get("year"), "tmdbId": i.get("tmdbId")}
+        seen_lines = "\n".join(
+            f"- {i.get('title') or '?'} ({i.get('year') or '?'})"
             for i in seen_items
             if i.get("title") or i.get("tmdbId")
-        ]
+        ) or "(leer)"
 
         response = client.responses.create(
             model=OPENAI_MODEL,
             input=[
                 {
                     "role": "system",
-                    "content": """
-Du bist ein Filmempfehlungs-Assistent für Radarr.
-Empfiehl Filme, die zur vorhandenen Bibliothek und exakt zur Nutzeranfrage passen.
-Beachte Anzahl, Genre, Regisseur, Schauspieler, Zeitraum, Erscheinungsjahr, Stimmung und Stil.
-Keine Filme empfehlen, die bereits in der Bibliothek vorhanden sind.
-Keine Filme empfehlen, die in der Liste "alreadySeen" stehen - diese hat der Nutzer schon gesehen oder bewusst abgelehnt.
-Gib ausschließlich gültiges JSON zurück. Kein Markdown.
-Format:
-{
-  "recommendations": [
-    {
-      "title": "Filmname",
-      "year": 2000,
-      "reason": "kurze Begründung"
-    }
-  ]
-}
-"""
+                    "content": (
+                        "Du bist ein Filmempfehlungs-Assistent für Radarr. "
+                        "Empfiehl Filme, die zur Bibliothek und exakt zur Anfrage passen. "
+                        "Beachte Anzahl, Genre, Regisseur, Schauspieler, Zeitraum, Stimmung, Stil. "
+                        "Empfiehl KEINE Filme aus den Listen \"Bibliothek\" oder \"Bereits gesehen\". "
+                        "Antworte ausschließlich mit gültigem JSON, kein Markdown:\n"
+                        "{\"recommendations\":[{\"title\":\"...\",\"year\":2000,\"reason\":\"...\"}]}"
+                    ),
                 },
                 {
                     "role": "user",
-                    "content": f"""
-Nutzerwunsch:
-{req.message}
-
-Maximale Anzahl:
-{req.count}
-
-Radarr-Kontext:
-{json.dumps(context, ensure_ascii=False)}
-
-alreadySeen (NICHT erneut empfehlen):
-{json.dumps(already_seen, ensure_ascii=False)}
-"""
-                }
+                    "content": (
+                        f"Wunsch: {req.message}\n"
+                        f"Anzahl: {req.count}\n\n"
+                        f"Bibliothek ({len(existing_tmdb)} Filme):\n{existing_lines}\n\n"
+                        f"Bereits gesehen:\n{seen_lines}"
+                    ),
+                },
             ],
+            max_output_tokens=1200,
         )
 
         data = extract_json(response.output_text)
