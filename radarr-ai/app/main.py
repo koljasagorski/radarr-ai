@@ -1,6 +1,8 @@
 import os
 import json
 import re
+from datetime import datetime, timezone
+from typing import Optional
 import requests
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -14,6 +16,7 @@ load_dotenv()
 RADARR_URL = os.getenv("RADARR_URL", "").rstrip("/")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
+SEEN_FILE = os.getenv("SEEN_FILE", "/app/seen_movies.json")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI(title="Radarr KI Assistent")
@@ -37,6 +40,16 @@ class AddMovieRequest(BaseModel):
 class RecommendRequest(BaseModel):
     message: str
     count: int = 5
+
+
+class MarkSeenRequest(BaseModel):
+    tmdbId: int
+    title: Optional[str] = None
+    year: Optional[int] = None
+
+
+class UnmarkSeenRequest(BaseModel):
+    tmdbId: int
 
 
 def radarr_headers():
@@ -71,6 +84,29 @@ def get_poster_url(movie: dict):
         if img.get("coverType") == "poster":
             return img.get("remoteUrl") or img.get("url")
     return None
+
+
+def load_seen_movies():
+    try:
+        if not os.path.exists(SEEN_FILE):
+            return []
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+
+def save_seen_movies(items):
+    os.makedirs(os.path.dirname(SEEN_FILE) or ".", exist_ok=True)
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def seen_tmdb_ids():
+    return {item.get("tmdbId") for item in load_seen_movies() if item.get("tmdbId")}
 
 
 def get_radarr_context():
@@ -953,6 +989,60 @@ main {
     backdrop-filter: blur(10px);
 }
 
+.seenToggle {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 3;
+    padding: 7px 11px;
+    border-radius: 999px;
+    color: #fff;
+    background: rgba(2,6,23,.72);
+    border: 1px solid rgba(255,255,255,.20);
+    backdrop-filter: blur(10px);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 800;
+    box-shadow: 0 8px 22px rgba(0,0,0,.32);
+    transition: background .16s ease, border-color .16s ease, transform .16s ease;
+}
+
+.seenToggle:hover {
+    background: rgba(40,209,124,.36);
+    border-color: rgba(40,209,124,.55);
+    transform: translateY(-1px);
+}
+
+.seenList {
+    display: grid;
+    gap: 10px;
+}
+
+.seenItem {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 18px;
+    background: rgba(2,6,23,.45);
+    border: 1px solid var(--border);
+}
+
+.seenItem b {
+    font-size: 14px;
+}
+
+.seenItem span {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.seenItem button {
+    padding: 8px 12px;
+    font-size: 12px;
+}
+
 .movieContent {
     display: flex;
     flex-direction: column;
@@ -1345,6 +1435,7 @@ main {
             <div class="tabs">
                 <button class="tabButton active" id="tab-config" onclick="switchTool('config')">Radarr-Ziel</button>
                 <button class="tabButton" id="tab-search" onclick="switchTool('search')">Manuelle Suche</button>
+                <button class="tabButton" id="tab-seen" onclick="switchTool('seen')">Gesehen-Liste</button>
                 <button class="tabButton" id="tab-chat" onclick="switchTool('chat')">Setup-Chat</button>
                 <button class="tabButton" id="tab-analysis" onclick="switchTool('analysis')">Library-Analyse</button>
             </div>
@@ -1381,6 +1472,19 @@ main {
                     </div>
                 </div>
                 <p class="smallMuted">Suchergebnisse erscheinen unten in denselben Cover-Karten und können ebenfalls zu Radarr hinzugefügt werden.</p>
+            </div>
+
+            <div class="toolPanel" id="tool-seen">
+                <p class="smallMuted">
+                    Hier sammelst du Filme, die du schon gesehen hast oder nicht (mehr) vorgeschlagen bekommen willst.
+                    Die KI bekommt diese Liste bei jeder neuen Anfrage mit und schlägt sie nicht erneut vor.
+                    Gespeichert in <code id="seenFilePath">seen_movies.json</code>.
+                </p>
+                <div class="actions">
+                    <button class="secondary" onclick="loadSeenList()">Liste neu laden</button>
+                    <span class="smallMuted" id="seenStatus">noch nicht geladen</span>
+                </div>
+                <div id="seenList" style="margin-top:14px;"></div>
             </div>
 
             <div class="toolPanel" id="tool-chat">
@@ -1465,10 +1569,11 @@ function openTool(tool) {
 }
 
 function switchTool(tool) {
-    ["config","search","chat","analysis"].forEach(name => {
+    ["config","search","seen","chat","analysis"].forEach(name => {
         document.getElementById("tool-" + name).classList.toggle("active", name === tool);
         document.getElementById("tab-" + name).classList.toggle("active", name === tool);
     });
+    if (tool === "seen") loadSeenList();
 }
 
 function clearResults() {
@@ -1637,6 +1742,7 @@ function renderMovies(movies, heading) {
 
         html += `
         <article class="movieCard" id="movie-${movie.tmdbId}">
+            <button class="seenToggle" title="Als schon gesehen markieren - wird nicht mehr vorgeschlagen" onclick="markSeen(${Number(movie.tmdbId)}, this)">✓ Schon gesehen</button>
             <div class="posterWrap">
                 ${poster}
                 <div class="posterShade"></div>
@@ -1771,6 +1877,129 @@ function markMovieAdded(tmdbId) {
         btn.disabled = true;
         btn.innerText = "Hinzugefügt";
     });
+}
+
+async function markSeen(tmdbId, button) {
+    const movie = movieCache.get(String(tmdbId));
+    const title = movie?.title || "Film";
+    const year = movie?.year || null;
+
+    if (button) {
+        button.disabled = true;
+        button.innerText = "...";
+    }
+
+    try {
+        const res = await fetch("/mark-seen", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({tmdbId, title, year})
+        });
+        const data = await res.json();
+
+        if (data.error) {
+            toast("Fehler: " + data.error, "err");
+            if (button) {
+                button.disabled = false;
+                button.innerText = "✓ Schon gesehen";
+            }
+            return;
+        }
+
+        toast(`Als gesehen markiert: ${title}`, "ok");
+        const card = document.getElementById("movie-" + tmdbId);
+        if (card) {
+            card.style.transition = "opacity .25s ease, transform .25s ease";
+            card.style.opacity = "0";
+            card.style.transform = "scale(.96)";
+            setTimeout(() => card.remove(), 260);
+        }
+    } catch (err) {
+        toast("Fehler: " + err.toString(), "err");
+        if (button) {
+            button.disabled = false;
+            button.innerText = "✓ Schon gesehen";
+        }
+    }
+}
+
+async function loadSeenList() {
+    const box = document.getElementById("seenList");
+    const status = document.getElementById("seenStatus");
+    box.innerHTML = `<div class="loading"><b>Lade Liste...</b></div>`;
+    status.innerText = "lade...";
+
+    try {
+        const res = await fetch("/seen-movies");
+        const data = await res.json();
+
+        if (data.error) {
+            box.innerHTML = `<div class="emptyState"><b>Fehler.</b>${escapeHtml(data.error)}</div>`;
+            status.innerText = "Fehler";
+            return;
+        }
+
+        const items = data.items || [];
+        status.innerText = `${items.length} Eintrag/Einträge`;
+
+        if (!items.length) {
+            box.innerHTML = `<div class="emptyState"><b>Liste ist leer.</b>Markiere Empfehlungen mit „✓ Schon gesehen“, damit sie hier landen.</div>`;
+            return;
+        }
+
+        let html = `<div class="seenList">`;
+        items.forEach(item => {
+            const id = Number(item.tmdbId);
+            const date = item.markedAt ? new Date(item.markedAt).toLocaleDateString("de-DE") : "";
+            html += `
+                <div class="seenItem" id="seen-${id}">
+                    <div>
+                        <b>${escapeHtml(item.title || "Unbekannt")}</b>
+                        <span> · ${item.year || "?"} · TMDB ${id}${date ? " · markiert " + escapeHtml(date) : ""}</span>
+                    </div>
+                    <button class="secondary" onclick="unmarkSeen(${id}, this)">Entfernen</button>
+                </div>`;
+        });
+        html += `</div>`;
+        box.innerHTML = html;
+    } catch (err) {
+        box.innerHTML = `<div class="emptyState"><b>Fehler.</b>${escapeHtml(err.toString())}</div>`;
+        status.innerText = "Fehler";
+    }
+}
+
+async function unmarkSeen(tmdbId, button) {
+    if (button) {
+        button.disabled = true;
+        button.innerText = "...";
+    }
+
+    try {
+        const res = await fetch("/unmark-seen", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({tmdbId})
+        });
+        const data = await res.json();
+
+        if (data.error) {
+            toast("Fehler: " + data.error, "err");
+            if (button) {
+                button.disabled = false;
+                button.innerText = "Entfernen";
+            }
+            return;
+        }
+
+        toast("Aus Gesehen-Liste entfernt", "ok");
+        loadSeenList();
+    } catch (err) {
+        toast("Fehler: " + err.toString(), "err");
+        if (button) {
+            button.disabled = false;
+            button.innerText = "Entfernen";
+        }
+    }
 }
 
 async function sendMessage() {
@@ -1930,6 +2159,14 @@ def recommend_movies(req: RecommendRequest):
         context = get_radarr_context()
         existing_tmdb = {m.get("tmdbId") for m in context["movies"] if m.get("tmdbId")}
 
+        seen_items = load_seen_movies()
+        seen_ids = {i.get("tmdbId") for i in seen_items if i.get("tmdbId")}
+        already_seen = [
+            {"title": i.get("title"), "year": i.get("year"), "tmdbId": i.get("tmdbId")}
+            for i in seen_items
+            if i.get("title") or i.get("tmdbId")
+        ]
+
         response = client.responses.create(
             model=OPENAI_MODEL,
             input=[
@@ -1940,6 +2177,7 @@ Du bist ein Filmempfehlungs-Assistent für Radarr.
 Empfiehl Filme, die zur vorhandenen Bibliothek und exakt zur Nutzeranfrage passen.
 Beachte Anzahl, Genre, Regisseur, Schauspieler, Zeitraum, Erscheinungsjahr, Stimmung und Stil.
 Keine Filme empfehlen, die bereits in der Bibliothek vorhanden sind.
+Keine Filme empfehlen, die in der Liste "alreadySeen" stehen - diese hat der Nutzer schon gesehen oder bewusst abgelehnt.
 Gib ausschließlich gültiges JSON zurück. Kein Markdown.
 Format:
 {
@@ -1964,6 +2202,9 @@ Maximale Anzahl:
 
 Radarr-Kontext:
 {json.dumps(context, ensure_ascii=False)}
+
+alreadySeen (NICHT erneut empfehlen):
+{json.dumps(already_seen, ensure_ascii=False)}
 """
                 }
             ],
@@ -1988,7 +2229,7 @@ Radarr-Kontext:
             best = lookup[0]
             tmdb_id = best.get("tmdbId")
 
-            if not tmdb_id or tmdb_id in existing_tmdb:
+            if not tmdb_id or tmdb_id in existing_tmdb or tmdb_id in seen_ids:
                 continue
 
             enriched.append({
@@ -2002,6 +2243,45 @@ Radarr-Kontext:
 
         return {"recommendations": enriched[:req.count]}
 
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/seen-movies")
+def get_seen_movies():
+    try:
+        items = load_seen_movies()
+        items.sort(key=lambda x: x.get("markedAt", ""), reverse=True)
+        return {"items": items, "count": len(items)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/mark-seen")
+def mark_seen(req: MarkSeenRequest):
+    try:
+        items = load_seen_movies()
+        items = [i for i in items if i.get("tmdbId") != req.tmdbId]
+        items.append({
+            "tmdbId": req.tmdbId,
+            "title": req.title,
+            "year": req.year,
+            "markedAt": datetime.now(timezone.utc).isoformat(),
+        })
+        save_seen_movies(items)
+        return {"status": "ok", "count": len(items)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/unmark-seen")
+def unmark_seen(req: UnmarkSeenRequest):
+    try:
+        items = load_seen_movies()
+        before = len(items)
+        items = [i for i in items if i.get("tmdbId") != req.tmdbId]
+        save_seen_movies(items)
+        return {"status": "ok", "count": len(items), "removed": before - len(items)}
     except Exception as e:
         return {"error": str(e)}
 
