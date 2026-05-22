@@ -2196,7 +2196,7 @@ def recommend_movies(req: RecommendRequest):
                     ),
                 },
             ],
-            max_output_tokens=1200,
+            max_output_tokens=max(1500, req.count * 200 + 400),
         )
 
         data = extract_json(response.output_text)
